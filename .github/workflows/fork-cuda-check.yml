@@ -1,0 +1,123 @@
+# PRIMARY: fork-only CUDA compile check. DO NOT include in the PR to ml-explore/mlx.
+#
+# Reuses MLX's own ./.github/actions/setup and ./.github/actions/build unchanged,
+# so the toolkit packages, the cmake flags (incl. -DCMAKE_COMPILE_WARNING_AS_ERROR=ON)
+# and the Debug/Ninja config are byte-identical to what Apple's CI runs.
+#
+# The only reason this file exists rather than build_and_test.yml is that
+# build_and_test.yml's build_and_test job is gated on
+#   if: github.repository == 'ml-explore/mlx'
+# and routes x86_64+cuda to the org-only runner label gpu-t4-4-core.
+#
+# No GPU is needed: .github/actions/setup/action.yml detects the missing device
+# (`if ! __nvcc_device_query`) and falls back to
+#   -DMLX_CUDA_ARCHITECTURES=80 -DMLX_BUILD_TESTS=OFF -DMLX_BUILD_PYTHON_STUBS=OFF
+# MLX_BUILD_EXAMPLES stays ON, so libmlx is linked and examples/cpp/* are linked
+# against it -- that is what catches undefined-symbol/vtable failures, not just nvcc.
+
+name: Fork CUDA check
+
+on:
+  push:
+    branches: ['test/*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-cuda-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda:
+    name: ${{ matrix.arch }} (${{ matrix.toolkit }})
+    runs-on: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        toolkit: ['cuda-12.6', 'cuda-12.9', 'cuda-13.0']
+        arch: ['x86_64']
+        include:
+          - arch: x86_64
+            host: ubuntu-22.04
+        # To also cover aarch64 (the leg Apple's CI runs GPU-less), make BOTH
+        # edits together -- an include row alone would spawn a toolkit-less job:
+        #   arch: ['x86_64', 'aarch64']
+        #   include:  ...  - {arch: aarch64, host: ubuntu-22.04-arm}
+        # If the arm jobs sit in "Queued" >5 min, that label is not available
+        # to your fork; revert both edits.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # ~30s of insurance so the "is 14 GB enough?" question never has to be answered.
+      - name: Reclaim disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /usr/share/swift /usr/local/share/boost || true
+          df -h /
+
+      - uses: ./.github/actions/setup
+        id: setup
+        with:
+          toolkit: ${{ matrix.toolkit }}
+          ccache-key: 'fork-cuda'
+
+      - uses: ./.github/actions/build
+        with:
+          cmake-args: ${{ steps.setup.outputs.cmake-args }}
+          debug: 'true'      # matches upstream: Debug on Linux
+
+      - name: Prove sort.cu was compiled and libmlx linked
+        run: |
+          nvcc --version
+          test -n "$(find build -name 'sort.cu.o' -print -quit)" \
+            || { echo "FAIL: sort.cu.o was never built"; exit 1; }
+          test -n "$(find build -name 'libmlx.so' -print -quit)" \
+            || { echo "FAIL: libmlx.so was never linked"; exit 1; }
+          find build \( -name 'sort.cu.o' -o -name 'libmlx.so' \) -exec ls -lh {} +
+          nm -C "$(find build -name libmlx.so -print -quit)" 2>/dev/null \
+            | grep -i 'SearchSorted::eval_gpu' \
+            || echo "note: eval_gpu symbol not visible in nm output"
+          df -h /
+
+  # Can a FREE windows runner do a CUDA build? Upstream routes Windows CUDA to
+  # windows-2022-large, which suggests the free runner is too small, but that was
+  # never measured. This leg finds out. MSVC's nvcc is stricter than gcc's about
+  # constant expressions in template arguments, which is a class of error the
+  # Linux legs above cannot catch.
+  windows-cuda:
+    name: windows (${{ matrix.toolkit }})
+    runs-on: windows-2022
+    continue-on-error: true      # informational: we are probing feasibility
+    strategy:
+      fail-fast: false
+      matrix:
+        toolkit: ['cuda-12.9']
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Disk before
+        shell: bash
+        run: df -h /c 2>/dev/null || wmic logicaldisk get size,freespace,caption
+
+      - uses: ./.github/actions/setup
+        id: setup
+        with:
+          toolkit: ${{ matrix.toolkit }}
+          ccache-key: 'fork-cuda-win'
+
+      - uses: ./.github/actions/build
+        with:
+          cmake-args: ${{ steps.setup.outputs.cmake-args }}
+
+      - name: Prove sort.cu compiled
+        shell: bash
+        run: |
+          find build -name 'sort.cu.obj' -print -quit | grep -q . \
+            && echo "OK: sort.cu.obj built under MSVC" \
+            || { echo "FAIL: sort.cu.obj missing"; exit 1; }
+          df -h /c 2>/dev/null || true
