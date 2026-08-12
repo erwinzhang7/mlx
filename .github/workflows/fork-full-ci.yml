@@ -1,0 +1,140 @@
+# Fork-only mirror of upstream's build_and_test.yml. DO NOT include in a PR to ml-explore/mlx.
+#
+# Upstream's workflow is gated on `if: github.repository == 'ml-explore/mlx'` and routes some
+# jobs to runners a personal fork cannot use. This mirrors as much of the matrix as free
+# runners allow, so a PR can be pre-verified instead of waiting for a maintainer to approve
+# workflows, which for this account has meant CI never running at all on 4 of 5 PRs.
+#
+# Runner remapping vs upstream:
+#   Linux x86_64 + CUDA   gpu-t4-4-core      -> ubuntu-22.04      (compile only, no GPU needed)
+#   Windows x86_64 + CUDA windows-2022-large -> windows-2022      (probe: may run out of disk)
+#   Linux aarch64         ubuntu-22.04-arm   -> unchanged, free for public repos
+#   macOS                 macos-26           -> unchanged, free
+#   Test macOS            [self-hosted]      -> dropped, no self-hosted runner
+#
+# What this CANNOT do: run anything that needs an actual NVIDIA GPU. The CUDA legs compile
+# and link only. The setup action already handles that: it falls back to
+# -DMLX_CUDA_ARCHITECTURES=80 -DMLX_BUILD_TESTS=OFF when __nvcc_device_query finds no device.
+
+name: Fork full CI
+
+on:
+  push:
+    branches: ['test/*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-full-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          toolkit: 'cpu'
+      - name: Lint
+        shell: bash
+        run: |
+          pip install pre-commit
+          pre-commit run --all-files --show-diff-on-failure
+
+  linux:
+    name: linux ${{ matrix.arch }} (${{ matrix.toolkit }})
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ['x86_64', 'aarch64']
+        toolkit: ['cpu', 'cuda-12.6', 'cuda-12.9', 'cuda-13.0']
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reclaim disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /usr/share/swift /usr/local/share/boost || true
+          df -h /
+      - uses: ./.github/actions/setup
+        id: setup
+        with:
+          toolkit: ${{ matrix.toolkit }}
+          ccache-key: 'fork-linux-${{ matrix.arch }}'
+      - uses: ./.github/actions/build
+        with:
+          cmake-args: ${{ steps.setup.outputs.cmake-args }}
+          debug: 'true'
+      # Tests only where they can actually run: no GPU on these runners, so CUDA legs
+      # are compile-and-link only.
+      - uses: ./.github/actions/test-linux
+        if: matrix.toolkit == 'cpu'
+
+  windows:
+    name: windows ${{ matrix.arch }} (${{ matrix.toolkit }})
+    runs-on: ${{ matrix.arch == 'aarch64' && 'windows-11-arm' || 'windows-2022' }}
+    # The CUDA legs here are a feasibility probe: upstream uses windows-2022-large, which
+    # implies the free runner may be too small for the Windows CUDA toolkit. Not a gate.
+    continue-on-error: ${{ startsWith(matrix.toolkit, 'cuda') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ['x86_64', 'aarch64']
+        toolkit: ['cpu', 'cuda-12.9', 'cuda-13.0']
+        exclude:
+          # CUDA does not support Windows on arm, same exclusion upstream has.
+          - arch: 'aarch64'
+            toolkit: 'cuda-12.9'
+          - arch: 'aarch64'
+            toolkit: 'cuda-13.0'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Disk before
+        shell: bash
+        run: df -h /c 2>/dev/null || true
+      - uses: ./.github/actions/setup
+        id: setup
+        with:
+          toolkit: ${{ matrix.toolkit }}
+          ccache-key: 'fork-win-${{ matrix.arch }}'
+      - uses: ./.github/actions/build
+        with:
+          cmake-args: ${{ steps.setup.outputs.cmake-args }}
+          # MSVC: Ninja/Release is the only config ccache supports, same as upstream.
+          debug: 'false'
+      - uses: ./.github/actions/test-windows
+        if: matrix.toolkit == 'cpu'
+      - name: Disk after
+        if: always()
+        shell: bash
+        run: df -h /c 2>/dev/null || true
+
+  macos:
+    name: macos ${{ matrix.macos-target }} (${{ matrix.toolkit }})
+    runs-on: 'macos-26'
+    strategy:
+      fail-fast: false
+      matrix:
+        macos-target: ['14.0', '15.0', '26.2']
+        toolkit: ['cpu', 'metal', 'jit']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        id: setup
+        with:
+          toolkit: ${{ matrix.toolkit }}
+          ccache-key: 'fork-mac-${{ matrix.macos-target }}'
+          ccache-save: ${{ matrix.toolkit == 'metal' }}
+          ccache-toolkit: 'metal'
+      - uses: ./.github/actions/build-macos
+        with:
+          cmake-args: ${{ steps.setup.outputs.cmake-args }}
+          macos-target: ${{ matrix.macos-target }}
+      - uses: ./.github/actions/test-macos
+        if: matrix.toolkit == 'cpu'
+        with:
+          toolkit: 'cpu'
