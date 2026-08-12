@@ -1,5 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
+#include <cstdlib>
+#include <iostream>
 #include <unordered_map>
 
 #include "mlx/backend/cuda/cuda.h"
@@ -158,6 +160,34 @@ Group register_group(std::shared_ptr<detail::GroupImpl> group, std::string bk) {
   return Group(group);
 }
 
+// A backend that initializes a group of size 1 looks the same to init() as no
+// distributed setup at all, so "any" stops there and never reaches jaccl. Open
+// MPI does this whenever libmpi is available but the program was not started
+// with mpirun. The result is a program that runs on a single node without
+// reporting anything, so point at the explicit backend instead.
+void warn_if_size_one_over_jaccl(
+    const std::shared_ptr<detail::GroupImpl>& group,
+    const std::string& bk) {
+  if (group == nullptr || bk == "jaccl" || group->size() > 1) {
+    return;
+  }
+
+  auto getenv_either = [](const char* a, const char* b) {
+    const char* value = std::getenv(a);
+    return (value != nullptr) ? value : std::getenv(b);
+  };
+  if (getenv_either("JACCL_COORDINATOR", "MLX_JACCL_COORDINATOR") == nullptr ||
+      getenv_either("JACCL_IBV_DEVICES", "MLX_IBV_DEVICES") == nullptr) {
+    return;
+  }
+
+  std::cerr << "[distributed] The " << bk
+            << " backend was selected with a group of size 1 while jaccl is "
+            << "configured. A backend that reports size 1 stops backend=\"any\""
+            << " before it reaches jaccl. Pass backend=\"jaccl\" to init() to "
+            << "select it explicitly." << std::endl;
+}
+
 } // namespace
 
 Group init(bool strict /* = false */, const std::string& bk /* = "any" */) {
@@ -199,6 +229,7 @@ Group init(bool strict /* = false */, const std::string& bk /* = "any" */) {
     if (group == nullptr && strict) {
       throw std::runtime_error("[distributed] Couldn't initialize any backend");
     }
+    warn_if_size_one_over_jaccl(group, bk_);
   } else {
     std::ostringstream msg;
     msg << "[distributed] The only valid values for backend are 'any', 'mpi', 'nccl', "
